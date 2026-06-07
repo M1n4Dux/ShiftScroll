@@ -7,19 +7,26 @@ import threading
 import rumps
 
 # --- CONFIGURATION ---
-CONFIG_FILE = os.path.expanduser("~/.shiftscroll_config.json")
+SHIFTSCROLL_DIR = os.path.expanduser("~/.ShiftScroll")
+CONFIG_FILE = os.path.join(SHIFTSCROLL_DIR, "config.json")
+INSTANCE_LOCK_FILE = os.path.join(SHIFTSCROLL_DIR, "lock")
+MENU_BAR_ICON_FILE = os.path.join(SHIFTSCROLL_DIR, "menubar_icon.png")
 LOGIN_AGENT_LABEL = "com.vominhduc.shiftscroll"
 LOGIN_AGENT_FILE = os.path.expanduser(f"~/Library/LaunchAgents/{LOGIN_AGENT_LABEL}.plist")
-INSTANCE_LOCK_FILE = os.path.expanduser("~/.shiftscroll.lock")
-MENU_BAR_ICON_FILE = os.path.expanduser("~/.shiftscroll_menubar_icon.png")
 SCROLL_STEP_MIN = 1
 SCROLL_STEP_MAX = 12
 _INSTANCE_LOCK_HANDLE = None
+
+
+def ensure_shiftscroll_dir():
+    """Ensure the ~/.ShiftScroll directory exists."""
+    os.makedirs(SHIFTSCROLL_DIR, exist_ok=True)
 
 # Default settings matching the UI
 DEFAULT_CONFIG = {
     "enabled": True,
     "start_at_login": False,
+    "disable_ctrl_click": False,
     "rev_vert": True,
     "rev_horiz": False,
     "apply_trackpad": False,
@@ -58,6 +65,7 @@ def acquire_single_instance_lock():
         return True
 
     try:
+        ensure_shiftscroll_dir()
         import fcntl
 
         _INSTANCE_LOCK_HANDLE = open(INSTANCE_LOCK_FILE, "w")
@@ -146,6 +154,7 @@ def set_start_at_login(enabled):
 
 def create_menu_bar_icon():
     try:
+        ensure_shiftscroll_dir()
         from PIL import Image, ImageDraw
 
         scale = 3
@@ -185,6 +194,7 @@ def create_menu_bar_icon():
 
 
 def load_config():
+    ensure_shiftscroll_dir()
     config = DEFAULT_CONFIG.copy()
 
     if os.path.exists(CONFIG_FILE):
@@ -199,6 +209,7 @@ def load_config():
 
     config["enabled"] = bool(config["enabled"])
     config["start_at_login"] = is_start_at_login_enabled()
+    config["disable_ctrl_click"] = bool(config["disable_ctrl_click"])
     config["rev_vert"] = bool(config["rev_vert"])
     config["rev_horiz"] = bool(config["rev_horiz"])
     config["apply_trackpad"] = bool(config["apply_trackpad"])
@@ -208,6 +219,7 @@ def load_config():
 
 
 def save_config(config):
+    ensure_shiftscroll_dir()
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=2)
 
@@ -444,7 +456,7 @@ def run_settings_ui():
     root.title("ShiftScroll Settings")
     root.configure(bg=bg)
     root.resizable(False, False)
-    center_window(root, 400, 390)
+    center_window(root, 400, 400)
 
     is_syncing = False
 
@@ -455,6 +467,7 @@ def run_settings_ui():
 
         config["enabled"] = bool(var_enabled.get())
         config["start_at_login"] = bool(var_start_login.get())
+        config["disable_ctrl_click"] = bool(var_disable_ctrl_click.get())
         config["rev_vert"] = bool(var_rev_vert.get())
         config["rev_horiz"] = bool(var_rev_horiz.get())
         config["apply_trackpad"] = bool(var_trackpad.get())
@@ -478,6 +491,7 @@ def run_settings_ui():
 
     var_enabled = tk.BooleanVar(value=config["enabled"])
     var_start_login = tk.BooleanVar(value=config["start_at_login"])
+    var_disable_ctrl_click = tk.BooleanVar(value=config["disable_ctrl_click"])
     var_rev_vert = tk.BooleanVar(value=config["rev_vert"])
     var_rev_horiz = tk.BooleanVar(value=config["rev_horiz"])
     var_trackpad = tk.BooleanVar(value=config["apply_trackpad"])
@@ -487,6 +501,7 @@ def run_settings_ui():
     for var in (
         var_enabled,
         var_start_login,
+        var_disable_ctrl_click,
         var_rev_vert,
         var_rev_horiz,
         var_trackpad,
@@ -518,6 +533,15 @@ def run_settings_ui():
         top_options,
         "Start at login",
         var_start_login,
+        bg,
+        size=18,
+        font_size=12,
+        gap=8,
+    ).pack(anchor=tk.W, pady=(5, 0))
+    ModernCheckbutton(
+        top_options,
+        "Disable Ctrl+Click",
+        var_disable_ctrl_click,
         bg,
         size=18,
         font_size=12,
@@ -733,6 +757,8 @@ class ShiftScrollApp(rumps.App):
     def open_settings(self, _):
         # Spawn the UI in a completely isolated process to prevent macOS threading crashes
         if self.settings_process and self.settings_process.poll() is None:
+            # Settings window is already open, bring it to focus
+            self.focus_settings_window()
             return
 
         env = os.environ.copy()
@@ -741,6 +767,18 @@ class ShiftScrollApp(rumps.App):
             [sys.executable, sys.argv[0], "--settings"],
             env=env,
         )
+
+    def focus_settings_window(self):
+        """Bring the settings window to the front."""
+        try:
+            script = '''
+            tell application "System Events"
+                set frontmost of every process whose name contains "Python" to true
+            end tell
+            '''
+            subprocess.run(["osascript", "-e", script], check=False)
+        except Exception:
+            pass
 
     def close_settings_window(self):
         if not self.settings_process or self.settings_process.poll() is not None:
@@ -756,6 +794,10 @@ class ShiftScrollApp(rumps.App):
         from Quartz import (
             kCGEventScrollWheel,
             kCGEventFlagMaskShift,
+            kCGEventFlagMaskControl,
+            kCGEventLeftMouseDown,
+            kCGEventLeftMouseUp,
+            kCGEventLeftMouseDragged,
             kCGScrollWheelEventDeltaAxis1,
             kCGScrollWheelEventDeltaAxis2,
             kCGScrollWheelEventPointDeltaAxis1,
@@ -771,6 +813,14 @@ class ShiftScrollApp(rumps.App):
             kCGScrollWheelEventIsContinuous
         )
         import math
+
+        # Handle Ctrl+Click disabling for left mouse events
+        if self.config["enabled"] and self.config["disable_ctrl_click"]:
+            if event_type in (kCGEventLeftMouseDown, kCGEventLeftMouseUp, kCGEventLeftMouseDragged):
+                flags = CGEventGetFlags(cg_event)
+                if flags & kCGEventFlagMaskControl:
+                    CGEventSetFlags(cg_event, flags & ~kCGEventFlagMaskControl)
+                return cg_event
 
         if event_type != kCGEventScrollWheel or not self.config["enabled"]:
             return cg_event
@@ -886,6 +936,9 @@ class ShiftScrollApp(rumps.App):
             kCGHeadInsertEventTap,
             kCGEventTapOptionDefault,
             kCGEventScrollWheel,
+            kCGEventLeftMouseDown,
+            kCGEventLeftMouseUp,
+            kCGEventLeftMouseDragged,
             CFMachPortCreateRunLoopSource,
             CFRunLoopGetCurrent,
             CFRunLoopAddSource,
@@ -893,7 +946,12 @@ class ShiftScrollApp(rumps.App):
             CFRunLoopRun,
         )
 
-        event_mask = 1 << kCGEventScrollWheel
+        event_mask = (
+            1 << kCGEventScrollWheel |
+            1 << kCGEventLeftMouseDown |
+            1 << kCGEventLeftMouseUp |
+            1 << kCGEventLeftMouseDragged
+        )
         tap = CGEventTapCreate(
             kCGSessionEventTap,
             kCGHeadInsertEventTap,
@@ -929,6 +987,7 @@ class ShiftScrollApp(rumps.App):
 
 
 if __name__ == "__main__":
+    ensure_shiftscroll_dir()
     # If the script is called with the settings argument, launch the UI window.
     if len(sys.argv) > 1 and sys.argv[1] == "--settings":
         run_settings_ui()
